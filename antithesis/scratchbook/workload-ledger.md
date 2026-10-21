@@ -37,7 +37,7 @@ from [api-surface.md](api-surface.md). One row per local iteration and one per A
 | 28 | 2026-10-21 | — (Antithesis run of rows 25 and 27, commit `a34e1371`) | 0, 1, 2, 3 | — | `4d31ac7b71d37b2cf0e6f8e8ac0fb146-64-4` (60 min, turbo, default faults) | no coverage export (turbo) | validation before long runs. 83 properties pass. Failing: Guarantee 2's "public decryption answered by all four cores succeeds within 300 s…" (50) and its command's exit code, a suspected SUT finding, not caused by the workload (Status, 2026-10-21, stall after a core restart); the known container exits (exit 1: 1,836; exit 101: 26; init: 122). So rows 25 and 27 add no false positive |
 | 29 | 2026-10-21 | iter17 (input review, candidate 2): keygens and CRS generations in a PRSS-only or confirmed reshared epoch, in a per-timeline share (0/20/40 %; `generation_epoch`), with their own budgets (3 keygens, 2 insecure CRSes per container). Keys and CRSes record their home epoch; decryptions use a key's home as its default epoch, reshares start from it, existing-keyset keygens and CRS re-signing stay within one epoch, and the recovery check only uses keys born in the kms-init epoch (a key born in a destroyed epoch would otherwise fail Guarantee 2 on a correct system) | 0, 1, 2, 3 | +312 lines over iter16 (16,690 / 3,236 merged; seeds 15,001–16,434; seeds 4–6): key material stored under other epochs (`crypto_material/threshold.rs` +120), `key_generator.rs`, `epoch_manager.rs`, signing | — | — | kept. 7–9 completed keygens per seed, 2 valid CRS generations in other epochs in two seeds. No false Always/Unreachable. A first version (iter17a, seeds 1–3) shared the key and CRS budgets, which are spent before other epochs exist: only spent or invalid requests went to other epochs |
 | 30 | 2026-10-21 | — (Antithesis run of row 29, commit `2fe3d48a`) | 0, 1, 2, 3 | — | `d33556309d1fea4d9cba0efbf83769a3-64-4` (60 min, turbo, default faults) | no coverage export (turbo) | validation before long runs. 82 properties pass. Failing: both Guarantee 2 Always and the recovery command's exit code, each traced to the SUT, not the workload (Status, 2026-10-21: a key migration that splits a key's shares, and row 21's CRS-write brick, this time on the keygen path); the known container exits (exit 1, exit 101, init exit 1). So row 29 adds no false positive |
-| 31 | 2026-10-21 | — (row 29's workload, commit `2fe3d48a`, under row 24's aggressive faults: the first aggressive run with key migrations and generation in other epochs) | 0, 1, 2, 3 | — | `c3a6ad766cbabe62fbaebdb9f9459bd7-64-4` (60 min, turbo; pod stop and kill every ~120 s each, strobing 60 s chaos / 30–90 s quiet, timing fuzzing) | pending | |
+| 31 | 2026-10-21 | — (row 29's workload, commit `2fe3d48a`, under row 24's aggressive faults: the first aggressive run with key migrations and generation in other epochs) | 0, 1, 2, 3 | — | `c3a6ad766cbabe62fbaebdb9f9459bd7-64-4` (60 min, turbo; pod stop and kill every ~120 s each, strobing 60 s chaos / 30–90 s quiet, timing fuzzing) | no coverage export (turbo) | 83 properties pass, every plaintext and reshare check among them (16,840 public and 8,761 user decryption plaintext checks, 5,066 / 1,019 under reshared epochs, 1,309 source-epoch checks after reshares, 1,049 reshare results, 1,194 public-key checks, authentication failure unreached), and Guarantee 2's connect bound (5,424). Failing: Guarantee 2's decryption bound (66 of 5,358) and the recovery command's exit code, one timeline family, the key-migration share split again (Status, 2026-10-21); the container exits (exit 1: 2,399, mostly a new boot brick: a migration of a reshared key, Status, 2026-10-21; exit 101: 23, the port-bind panic; init exit 1: 41, "dispatch failure" or "streaming error" reading MinIO) |
 
 ## How this workload differs from the skill's defaults
 
@@ -126,6 +126,44 @@ These were the user's instructions when the workload was started (2026-10-19):
 
 ## Status
 
+- 2026-10-21, SUT finding in `c3a6ad76…` (row 31; high confidence, reproduced locally without
+  faults): migrating a key that has been reshared bricks every core on its next restart. The
+  copy (`copy_compressed_key_to_original`, `crypto_material/threshold.rs`) replaces the key's
+  public `CompressedXofKeySet`, one object per key ID, and rewrites the key's `FheKeyInfo`
+  only in the epoch of the request (`key_generator.rs:1721`: "the copy targets the same
+  (old_key_id, epoch_id) pair"). Each epoch the key was reshared into keeps an `FheKeyInfo`
+  whose digest map names the old keyset. Boot verification checks the `FheKeyInfo` of every
+  epoch against the public objects (`verify_fhe_key_digests`,
+  `storage_material_verification.rs:132`), so the core fails "storage verification failed:
+  Compressed xof keyset digest mismatch" and exits, on every boot. Repair from peers can't
+  help: every peer that migrated holds the same new bytes, and here the default context has
+  no URLs anyway ("attempting to repair it from peers", then "no public storage URL recorded
+  for this node"). In the run (input_hash -6723516906831975139): first key `5225…` reshared
+  into epochs 08…02, 08…03 and 08…04 (vtimes 236–255), migrated at vtime 269 (all four cores
+  logged "Copied compressed key"), and then each core that was killed failed every boot: core
+  4 from vtime 460 (89 boots to vtime 1693), cores 1, 2 and 3 after their own kills. Boot
+  reads `FheKeyInfo` of `5225…` under 08…01 (migrated), 08…02 and 08…04. Guarantee 2's
+  connect bound didn't catch it: the recovery check started at vtime 1192.6 and the timeline
+  ended at 1693, before the 600 s bound. Reproduced with
+  `local/repro-migration-after-reshare.sh` (2026-10-21): reshare the first key into 08…02
+  (decrypts there), restart core 3 (Ready: the reshare alone is harmless), migrate the key
+  with all four cores up (decrypts after), then restart core 4 and core 2: each crash-looped
+  (5 restarts in 5 min) on "Compressed xof keyset digest mismatch", and with two cores down
+  the key can no longer be decrypted. A first, flawed run of the script (its reshare never
+  ran, the arguments carried the SDK's banner line) is the control: migration without a
+  reshare, then restarts of cores 4 and 2, both Ready, decryption fine. No wrong plaintext,
+  but a routine order of operations (reshare, then migrate the key to the compressed format)
+  takes down every core that restarts afterwards. The 77 reshares failing "Compressed key
+  digest verification failed" in this run are not a symptom: they are
+  `parallel_driver_epoch_reshare_rejected.py`'s deliberately wrong digests (e.g. vtime 229).
+- 2026-10-21, the key-migration share split recurs in `c3a6ad76…` (row 31), in the plainest
+  form so far: one migration, a 2–2 split. In input_hash -1325470828996284415 the first key
+  `2853…` was migrated by a keygen sent at vtime 711.6 (`9ab4…`); cores 4 and 3 were killed
+  mid-keygen (vtimes 895.9 and 910.9) and never copied, cores 1 and 2 copied at 914.1 and
+  914.2. After faults stopped every decryption of `2853…` failed on all four cores in
+  `RobustOpen` (Gao decoding failure, "Could not reconstruct the sharing"; 0/4 responses),
+  for the whole 300 s bound. All 66 Guarantee 2 decryption counterexamples are this family
+  (vtimes 1313–1315).
 - 2026-10-21, the speedrun's recovery-mode finding recurs in the 12 h run `1aa9f98d…`
   (Guarantee 2, decryption bound; written up, reviewed and fixed by the speedrun on
   2026-10-18: [violations/storage-error-enters-recovery-mode.md](violations/storage-error-enters-recovery-mode.md),
