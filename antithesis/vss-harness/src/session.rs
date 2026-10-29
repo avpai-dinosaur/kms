@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use algebra::structure_traits::ErrorCorrect;
+use itertools::Itertools;
 use rand::SeedableRng;
 use serde_json::json;
 use threshold_execution::communication::broadcast::SyncReliableBroadcast;
@@ -20,6 +21,7 @@ use threshold_types::session_id::SessionId;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer};
 
+use crate::checks::ids;
 use crate::decisions::LiarDecisions;
 use crate::sdk::random_u64;
 use crate::sometimes;
@@ -66,6 +68,7 @@ pub fn install_observer() -> anyhow::Result<()> {
     set_observer(Box::new(|session_id, role, event| {
         let liars = CURRENT_LIARS.lock().expect("liars lock").clone();
         if !liars.contains(&role) {
+            println!("{}", event_json(session_id, role, &event));
             mid_session_claims(&liars, role, &event);
         }
         EVENTS
@@ -73,6 +76,66 @@ pub fn install_observer() -> anyhow::Result<()> {
             .expect("events lock")
             .push((session_id, role, event));
     }))
+}
+
+/// Returns the log line of one observer event, with one-based role ids.
+fn event_json(session_id: SessionId, role: Role, event: &VssEvent) -> serde_json::Value {
+    let mut line = match event {
+        VssEvent::Round2 { corrupt } => {
+            json!({ "event": "vss_round", "round": 2, "corrupt": ids(corrupt) })
+        }
+        VssEvent::Round3 {
+            potentially_unhappy,
+            unhappy,
+            corrupt,
+        } => {
+            let disputes: Vec<[usize; 3]> = potentially_unhappy
+                .iter()
+                .map(|(d, i, j)| [d.one_based(), i.one_based(), j.one_based()])
+                .sorted()
+                .collect();
+            // Only dealers with a non-empty unhappy set, keyed by the dealer.
+            let unhappy: serde_json::Map<String, serde_json::Value> = unhappy
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| !set.is_empty())
+                .map(|(d, set)| ((d + 1).to_string(), json!(ids(set))))
+                .collect();
+            json!({
+                "event": "vss_round",
+                "round": 3,
+                "disputes": disputes,
+                "unhappy": unhappy,
+                "corrupt": ids(corrupt),
+            })
+        }
+        VssEvent::Round4Vote {
+            dealer,
+            unhappy_party,
+            voters,
+            yes_voters,
+            dealer_thrown_out,
+        } => json!({
+            "event": "vss_vote",
+            "dealer": dealer.one_based(),
+            "unhappy_party": unhappy_party.one_based(),
+            "voters": ids(voters),
+            "yes_voters": ids(yes_voters),
+            "dealer_thrown_out": dealer_thrown_out,
+        }),
+        VssEvent::Round4 {
+            corrupt,
+            repaired_from,
+        } => json!({
+            "event": "vss_round",
+            "round": 4,
+            "corrupt": ids(corrupt),
+            "repaired_from": ids(repaired_from),
+        }),
+    };
+    line["iteration"] = json!((u128::from(session_id) >> 64) as u64);
+    line["party"] = json!(role.one_based());
+    line
 }
 
 /// Reach claims that fire while the session runs, so that Antithesis can branch from the

@@ -18,7 +18,8 @@ use threshold_types::role::Role;
 use crate::session::Observed;
 use crate::{always, sometimes};
 
-fn ids<'a>(roles: impl IntoIterator<Item = &'a Role>) -> Vec<usize> {
+/// Returns the one-based ids of `roles`, sorted.
+pub fn ids<'a>(roles: impl IntoIterator<Item = &'a Role>) -> Vec<usize> {
     roles.into_iter().map(|r| r.one_based()).sorted().collect()
 }
 
@@ -115,11 +116,17 @@ fn interpolate<Z: ErrorCorrect>(shares: &[(Role, Z)], degree: usize) -> Option<P
 }
 
 /// Checks every property on the outcome of one session.
-pub fn check<Z: ErrorCorrect>(observed: &Observed<Z>, num_parties: usize, batch_size: usize) {
+pub fn check<Z: ErrorCorrect>(
+    observed: &Observed<Z>,
+    iteration: u64,
+    num_parties: usize,
+    batch_size: usize,
+) {
     let t = observed.threshold;
     let honest = &observed.honest;
     let liars = &observed.liars;
-    let base = json!({ "honest": ids(honest), "liars": ids(liars), "t": t });
+    let base =
+        json!({ "iteration": iteration, "honest": ids(honest), "liars": ids(liars), "t": t });
     let with = |extra: Value| {
         let mut details = base.clone();
         if let (Some(d), Value::Object(e)) = (details.as_object_mut(), extra) {

@@ -13,6 +13,13 @@
 //! - `VSS_ROUND_TIMEOUT_MS`: network timeout of one round (default 3000).
 //! - `VSS_LOG`: log level of the VSS code (default `error`).
 //! - `VSS_SEED`: seed of the local random generator. Antithesis supplies its own randomness.
+//!
+//! Output: one JSON line per event on stdout, each with the `iteration`.
+//! - `session_start`: the session's sizes, liars and liar profiles.
+//! - `vss_round` (rounds 2, 3 and 4) and `vss_vote`: the sets each honest `party` computed,
+//!   printed when it computes them.
+//! - `liar_choices`: every deviation each liar chose, in call order, printed before the checks.
+//! - `session_end`: the outcome.
 
 mod checks;
 mod decisions;
@@ -102,15 +109,20 @@ async fn run_one(iteration: u64, round_timeout: Duration) {
         })
     );
     if z128 {
-        run_ring::<ResiduePolyF4Z128, { ResiduePolyF4Z128::EXTENSION_DEGREE }>(&config, &decisions)
-            .await
+        run_ring::<ResiduePolyF4Z128, { ResiduePolyF4Z128::EXTENSION_DEGREE }>(
+            iteration, &config, &decisions,
+        )
+        .await
     } else {
-        run_ring::<ResiduePolyF4Z64, { ResiduePolyF4Z64::EXTENSION_DEGREE }>(&config, &decisions)
-            .await
+        run_ring::<ResiduePolyF4Z64, { ResiduePolyF4Z64::EXTENSION_DEGREE }>(
+            iteration, &config, &decisions,
+        )
+        .await
     }
 }
 
 async fn run_ring<Z: ErrorCorrect, const EXTENSION_DEGREE: usize>(
+    iteration: u64,
     config: &SessionConfig,
     decisions: &HashMap<Role, Arc<LiarDecisions>>,
 ) {
@@ -124,7 +136,15 @@ async fn run_ring<Z: ErrorCorrect, const EXTENSION_DEGREE: usize>(
         })
         .collect();
     let observed = session::run::<Z, EXTENSION_DEGREE>(config, decisions, secrets).await;
-    checks::check(&observed, config.num_parties, config.batch_size);
+    let choices: serde_json::Map<String, serde_json::Value> = decisions
+        .iter()
+        .map(|(role, d)| (role.one_based().to_string(), json!(d.choices())))
+        .collect();
+    println!(
+        "{}",
+        json!({ "event": "liar_choices", "iteration": iteration, "choices": choices })
+    );
+    checks::check(&observed, iteration, config.num_parties, config.batch_size);
     let corrupt = observed
         .corrupt
         .values()
@@ -139,6 +159,7 @@ async fn run_ring<Z: ErrorCorrect, const EXTENSION_DEGREE: usize>(
         "{}",
         json!({
             "event": "session_end",
+            "iteration": iteration,
             "finished": observed.finished,
             "corrupt": corrupt,
             "liar_deviations": observed.liar_deviations,

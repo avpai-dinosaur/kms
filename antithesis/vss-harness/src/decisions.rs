@@ -4,6 +4,8 @@
 //! extremes, and drops some deviations entirely. So one session concentrates on a few kinds of
 //! lies, and across sessions every combination comes up.
 
+use std::fmt::Debug;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
@@ -89,6 +91,8 @@ pub struct LiarDecisions {
     extra_answers: Point<usize>,
     one_secret_rate: f64,
     deviations: AtomicU64,
+    /// The deviations chosen so far, in call order, for the session log.
+    choices: Mutex<Vec<String>>,
 }
 
 impl LiarDecisions {
@@ -214,12 +218,25 @@ impl LiarDecisions {
             extra_answers: Point::draw(&LEAVE_RATES, &[1, 3]),
             one_secret_rate: pick(&[0.0, 0.5, 1.0]),
             deviations: AtomicU64::new(0),
+            choices: Mutex::new(Vec::new()),
         }
     }
 
     /// Returns the number of deviations the liar chose so far.
     pub fn deviations(&self) -> u64 {
         self.deviations.load(Ordering::Relaxed)
+    }
+
+    /// Returns the deviations chosen so far, in call order, for the session log.
+    pub fn choices(&self) -> Vec<String> {
+        self.choices.lock().expect("choices lock").clone()
+    }
+
+    /// Records `choice` with the text `entry` builds, if it is not the honest choice.
+    fn record<T: PartialEq + Debug>(&self, choice: &T, honest: &T, entry: impl FnOnce() -> String) {
+        if choice != honest {
+            self.choices.lock().expect("choices lock").push(entry());
+        }
     }
 
     /// Returns the profile, for the session log.
@@ -248,6 +265,9 @@ impl VssDecisions for LiarDecisions {
             Some(target) if target != receiver => Deal::Honest,
             _ => self.deal.choose(Deal::Honest, &self.deviations),
         };
+        self.record(&choice, &Deal::Honest, || {
+            format!("deal to P{}: {choice:?}", receiver.one_based())
+        });
         let details = json!({ "liar": self.role.one_based(), "receiver": receiver.one_based() });
         sometimes!(
             choice == Deal::OtherTable,
@@ -284,6 +304,9 @@ impl VssDecisions for LiarDecisions {
 
     fn participation(&self, round: usize) -> Participation {
         let choice = self.leave.choose(Participation::Send, &self.deviations);
+        self.record(&choice, &Participation::Send, || {
+            format!("round {round} broadcast: {choice:?}")
+        });
         let details = json!({ "liar": self.role.one_based(), "round": round });
         sometimes!(
             choice == Participation::Drop,
@@ -306,6 +329,14 @@ impl VssDecisions for LiarDecisions {
             &self.claim_other
         };
         let choice = point.choose(Claim::Honest, &self.deviations);
+        self.record(&choice, &Claim::Honest, || {
+            let side = if column { "column" } else { "row" };
+            format!(
+                "claim on dealer P{} with P{} ({side}): {choice:?}",
+                dealer.one_based(),
+                party.one_based()
+            )
+        });
         let details = json!({
             "liar": self.role.one_based(),
             "dealer": dealer.one_based(),
@@ -334,6 +365,13 @@ impl VssDecisions for LiarDecisions {
         let choice = self
             .dealer_answer
             .choose(DealerAnswer::Truth, &self.deviations);
+        self.record(&choice, &DealerAnswer::Truth, || {
+            format!(
+                "dealer answer (Pi P{}, Pj P{}): {choice:?}",
+                pi.one_based(),
+                pj.one_based()
+            )
+        });
         let details =
             json!({ "liar": self.role.one_based(), "pi": pi.one_based(), "pj": pj.one_based() });
         sometimes!(
@@ -373,6 +411,14 @@ impl VssDecisions for LiarDecisions {
         let choice = self
             .party_answer
             .choose(PartyAnswer::Honest, &self.deviations);
+        self.record(&choice, &PartyAnswer::Honest, || {
+            let as_role = if as_pi { "Pi" } else { "Pj" };
+            format!(
+                "answer as {as_role} on dealer P{} with P{}: {choice:?}",
+                dealer.one_based(),
+                other.one_based()
+            )
+        });
         let details = json!({
             "liar": self.role.one_based(),
             "dealer": dealer.one_based(),
@@ -404,6 +450,9 @@ impl VssDecisions for LiarDecisions {
 
     fn dealer_row(&self, unhappy_party: Role) -> DealerRow {
         let choice = self.dealer_row.choose(DealerRow::TrueRow, &self.deviations);
+        self.record(&choice, &DealerRow::TrueRow, || {
+            format!("row for unhappy P{}: {choice:?}", unhappy_party.one_based())
+        });
         let details =
             json!({ "liar": self.role.one_based(), "unhappy_party": unhappy_party.one_based() });
         sometimes!(
@@ -451,6 +500,9 @@ impl VssDecisions for LiarDecisions {
 
     fn unrequested_row(&self, party: Role) -> Option<DealerRow> {
         let choice = self.unrequested_row.choose(None, &self.deviations);
+        self.record(&choice, &None, || {
+            format!("unrequested row for P{}: {choice:?}", party.one_based())
+        });
         let details = json!({ "liar": self.role.one_based(), "party": party.one_based() });
         sometimes!(
             choice.is_some(),
@@ -467,6 +519,7 @@ impl VssDecisions for LiarDecisions {
 
     fn extra_answers(&self) -> usize {
         let count = self.extra_answers.choose(0, &self.deviations);
+        self.record(&count, &0, || format!("extra round-3 answers: {count}"));
         sometimes!(
             count > 0,
             "Liar adds round-3 answers for triples that are not its disputes",
@@ -477,6 +530,13 @@ impl VssDecisions for LiarDecisions {
 
     fn vote(&self, dealer: Role, unhappy_party: Role) -> Vote {
         let choice = self.vote.choose(Vote::Honest, &self.deviations);
+        self.record(&choice, &Vote::Honest, || {
+            format!(
+                "vote on dealer P{} for P{}: {choice:?}",
+                dealer.one_based(),
+                unhappy_party.one_based()
+            )
+        });
         let details = json!({
             "liar": self.role.one_based(),
             "dealer": dealer.one_based(),
@@ -501,11 +561,15 @@ impl VssDecisions for LiarDecisions {
     }
 
     fn lie_scope(&self) -> LieScope {
-        if chance(self.one_secret_rate) {
+        let scope = if chance(self.one_secret_rate) {
             LieScope::One
         } else {
             LieScope::All
-        }
+        };
+        self.record(&scope, &LieScope::All, || {
+            "next lie: one secret only".to_string()
+        });
+        scope
     }
 
     fn index(&self, len: usize) -> usize {
